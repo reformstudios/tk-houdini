@@ -13,7 +13,13 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 
-g_menu_item_script = os.path.join(os.path.dirname(__file__), "menu_action.py")
+# Make sure we always give Houdini forward-slash-delimited paths. There is
+# a crash bug in early releases of H17 on Windows when it's given backslash
+# paths to read.
+g_menu_item_script = os.path.join(
+    os.path.dirname(__file__),
+    "menu_action.py"
+).replace(os.path.sep, "/")
 
 # #3716 Fixes UNC problems with menus. Prefix '\' are otherwise concatenated to a single character, therefore using '/' instead.
 g_menu_item_script = g_menu_item_script.replace("\\", "/")
@@ -418,7 +424,6 @@ class AppCommandsPanelHandler(AppCommandsUI):
         root = ET.Element("pythonPanelDocument")
 
         for panel_cmd in self._panel_commands:
-
             panel_info = self._engine.get_panel_info(panel_cmd.name)
 
             interface = ET.SubElement(root, "interface")
@@ -451,24 +456,17 @@ class AppCommandsPanelHandler(AppCommandsUI):
             panel_help.text = desc
 
             # add the panel to the panetab and toolbar menus
+            panetab_menu = ET.SubElement(interface, "includeInPaneTabMenu")
+            panetab_menu.set("menu_position", "300")
+            panetab_menu.set("create_separator", "false")
 
-            toolbar_menu = ET.SubElement(root, "interfacesMenu")
-            toolbar_menu.set('type', 'toolbar')
-
-            toolbar_menu_item = ET.SubElement(toolbar_menu,
-                'interfaceItem')
-            toolbar_menu_item.set('name', panel_cmd.name)
-
-            panetab_menu = ET.SubElement(root, "interfacesMenu")
-            panetab_menu.set('type', 'panetab')
-
-            panetab_menu_item = ET.SubElement(panetab_menu,
-                'interfaceItem')
-            panetab_menu_item.set('name', panel_cmd.name)
+            toolbar_menu = ET.SubElement(interface, "includeInToolbarMenu")
+            toolbar_menu.set("menu_position", "300")
+            toolbar_menu.set("create_separator", "false")
 
         xml = _format_xml(ET.tostring(root, encoding="UTF-8"))
         _write_xml(xml, panels_file)
-        self._engine.logger.debug("Panels written to: %s" % (panels_file,))
+        self._engine.logger.debug("Panels written to: %s" % panels_file)
 
         # install the panels
         hou.pypanel.installFile(panels_file)
@@ -545,23 +543,28 @@ class AppCommandsShelf(AppCommandsUI):
         (context_cmds, cmds_by_app, favourite_cmds) = self._group_commands()
 
         # add the context menu tools first
+        self._engine.logger.debug("Creating context menu...")
         for cmd in context_cmds:
             tool = self.create_tool(shelf_file, cmd)
             shelf_tools.append(tool)
 
         # now add the favourites
+        self._engine.logger.debug("Creating favourites...")
         for cmd in favourite_cmds:
             tool = self.create_tool(shelf_file, cmd)
             shelf_tools.append(tool)
 
         # create tools for the remaining commands
+        self._engine.logger.debug("Creating app menu items...")
         for app_name in sorted(cmds_by_app.keys()):
             for cmd in cmds_by_app[app_name]:
                 if not cmd.favourite:
                     tool = self.create_tool(shelf_file, cmd)
                     shelf_tools.append(tool)
 
+        self._engine.logger.debug("Assigning tools to shelf %r..." % shelf)
         shelf.setTools(shelf_tools)
+        self._engine.logger.debug("...done!")
 
         # TODO: Currently there doesn't appear to be a way to add the sg shelf
         # to an existing shelf set programmatiaclly. Will be following up with
@@ -716,7 +719,7 @@ def get_registered_commands(engine):
 
     commands = []
 
-    sg_icon = os.path.join(engine.disk_location, "resources",
+    sg_icon = engine._safe_path_join(engine.disk_location, "resources",
         "shotgun_logo.png")
 
     jump_to_sg_cmd = AppCommand(
@@ -736,7 +739,7 @@ def get_registered_commands(engine):
     if engine.context.filesystem_locations:
         # Only show the jump to fs command if there are folders on disk.
 
-        fs_icon = os.path.join(engine.disk_location, "resources",
+        fs_icon = engine._safe_path_join(engine.disk_location, "resources",
             "shotgun_folder.png")
 
         jump_to_fs_cmd = AppCommand(
@@ -832,20 +835,50 @@ def get_wrapped_panel_widget(engine, widget_class, bundle, title):
             # if we're about to paint, see if we need to re-apply the style
             elif event.type() == QtCore.QEvent.Paint:
                 if not self._stylesheet_applied:
-                    self._apply_stylesheet()
+                    self.apply_stylesheet()
 
             return False
 
-        def _apply_stylesheet(self):
-
+        def apply_stylesheet(self):
+            import hou
             self._changing_stylesheet = True
             try:
-                if self.parent():
+                # This is only safe in pre-H16. If we do this in 16 it destroys
+                # some styling in Houdini itself.
+                if self.parent() and hou.applicationVersion() < (16, 0, 0):
                     self.parent().setStyleSheet("")
+
                 engine._apply_external_styleshet(bundle, self)
-            except Exception:
+
+                # Styling in H16+ is very different than in earlier versions of
+                # Houdini. The result is that we have to be more careful about
+                # behavior concerning stylesheets, because we might bleed into
+                # Houdini itself if we change qss on parent objects or make use
+                # of QStyles on the QApplication.
+                #
+                # Below, we're combining the engine-level qss with whatever is
+                # already assigned to the widget. This means that the engine
+                # styling is helping patch holes in any app- or framework-level
+                # qss that might have already been applied.
+                if hou.applicationVersion() >= (16, 0, 0):
+                    qss_file = engine._get_engine_qss_file()
+                    with open(qss_file, "rt") as f:
+                        qss_data = f.read()
+                        qss_data = engine._resolve_sg_stylesheet_tokens(qss_data)
+                        qss_data = qss_data.replace("{{ENGINE_ROOT_PATH}}", engine._get_engine_root_path())
+                        self.setStyleSheet(self.styleSheet() + qss_data)
+                        self.update()
+
+                    # We have some funky qss behavior in H16 that requires us to
+                    # kick the parent's stylesheet by reassigning it as is. Not
+                    # sure what causes the problem, but this does resolve it. The
+                    # original symptoms were some widgets not changing after applying
+                    # the engine's stylesheet, while others did.
+                    if self.parent():
+                        self.parent().setStyleSheet(self.parent().styleSheet())
+            except Exception, e:
                 engine.logger.warning(
-                    "Unable to re-apply stylesheet for panel: %s" % (title,)
+                    "Unable to re-apply stylesheet for panel: %s %s" % (title, e)
                 )
             finally:
                 self._changing_stylesheet = False
@@ -1072,6 +1105,7 @@ def createInterface():
             panel_info['bundle'],
             panel_info['title'],
         )
+        panel_widget.apply_stylesheet()
     except Exception:
         import traceback
         return NoPanelWidget(
@@ -1088,12 +1122,18 @@ def createInterface():
     # make sure it has the 'setLabel' method available. that at least implies
     # that it is a python panel 
     if pane_tab and hasattr(pane_tab, 'setLabel'):
-        title = panel_info.get('title', None)
-        name = panel_info.get('id', None)
+        title = panel_info.get('title')
         if title:
             pane_tab.setLabel(title)
-        if name:
-            pane_tab.setName(name)
+
+            # We're caching here based on title, because it's the
+            # bit of information we have that's reliably available
+            # from all of the various methods of showing this
+            # pane tab. We cache the pane tab's name so that if a
+            # second invokation of showing this particular panel is
+            # triggered, we just show that panel rather than opening
+            # a second instance.
+            engine._pane_cache[title] = pane_tab.name()
 
     return panel_widget
 
